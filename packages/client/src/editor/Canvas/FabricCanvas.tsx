@@ -42,6 +42,24 @@ export default function FabricCanvas() {
     return (fabricRef.current.getObjects().find((o: any) => o.name === 'background') as fabric.FabricImage) || null;
   }, []);
 
+  // 获取背景图在画布上的边界
+  const getImageBounds = useCallback((): { left: number; top: number; right: number; bottom: number } | null => {
+    const bg = getBackgroundImage();
+    if (!bg) return null;
+    const left = bg.left ?? 0;
+    const top = bg.top ?? 0;
+    const w = bg.width * (bg.scaleX ?? 1);
+    const h = bg.height * (bg.scaleY ?? 1);
+    return { left, top, right: left + w, bottom: top + h };
+  }, [getBackgroundImage]);
+
+  // 判断点是否在图片区域内
+  const isInsideImage = useCallback((x: number, y: number) => {
+    const bounds = getImageBounds();
+    if (!bounds) return false;
+    return x >= bounds.left && x <= bounds.right && y >= bounds.top && y <= bounds.bottom;
+  }, [getImageBounds]);
+
   // ============ 初始化画布 ============
   useEffect(() => {
     if (!canvasEl.current) return;
@@ -242,8 +260,9 @@ export default function FabricCanvas() {
         return;
       }
 
-      // 点击空白区域 → 创建新文字
+      // 点击空白区域 → 创建新文字（仅限图片区域内）
       const pointer = canvas.getScenePoint(opt.e);
+      if (!isInsideImage(pointer.x, pointer.y)) return;
       const text = new fabric.IText('双击编辑文字', {
         left: pointer.x,
         top: pointer.y,
@@ -407,9 +426,10 @@ export default function FabricCanvas() {
     const w = wrapper.clientWidth;
     const h = wrapper.clientHeight;
 
-    // 遮罩层
+    // 遮罩层（初始显示默认光标，鼠标移到图片区域后切换为笔刷指示器）
     const mc = maskCanvasRef.current;
     mc.width = w; mc.height = h;
+    mc.style.cursor = 'default';
     maskCtxRef.current = mc.getContext('2d');
     applyMaskContext();
 
@@ -496,23 +516,34 @@ export default function FabricCanvas() {
 
   const handleMaskMouseDown = useCallback((e: React.MouseEvent) => {
     if (activeTool !== 'ai-remove') return;
-    isDrawingRef.current = true;
     const x = e.nativeEvent.offsetX;
     const y = e.nativeEvent.offsetY;
+    if (!isInsideImage(x, y)) return;
+    isDrawingRef.current = true;
     activePointsRef.current = [{ x, y }];
     renderMaskComposite();
-  }, [activeTool, renderMaskComposite]);
+  }, [activeTool, isInsideImage, renderMaskComposite]);
 
   const handleMaskMouseMove = useCallback((e: React.MouseEvent) => {
     const x = e.nativeEvent.offsetX;
     const y = e.nativeEvent.offsetY;
     mousePosRef.current = { x, y };
-    drawIndicator(x, y);
+
+    // 图片区域内：隐藏光标显示笔刷指示器；区域外：显示默认光标
+    if (isInsideImage(x, y)) {
+      drawIndicator(x, y);
+      if (maskCanvasRef.current) maskCanvasRef.current.style.cursor = 'none';
+    } else {
+      const ctx = indicatorCtxRef.current;
+      const mc = indicatorCanvasRef.current;
+      if (ctx && mc) ctx.clearRect(0, 0, mc.width, mc.height);
+      if (maskCanvasRef.current) maskCanvasRef.current.style.cursor = 'default';
+    }
 
     if (!isDrawingRef.current) return;
     activePointsRef.current.push({ x, y });
     renderMaskComposite();
-  }, [drawIndicator, renderMaskComposite]);
+  }, [isInsideImage, drawIndicator, renderMaskComposite]);
 
   const handleMaskMouseUp = useCallback(() => {
     isDrawingRef.current = false;
@@ -521,9 +552,16 @@ export default function FabricCanvas() {
   }, [commitActiveStroke, renderMaskComposite]);
 
   const handleMaskMouseEnter = useCallback((e: React.MouseEvent) => {
-    mousePosRef.current = { x: e.nativeEvent.offsetX, y: e.nativeEvent.offsetY };
-    drawIndicator(e.nativeEvent.offsetX, e.nativeEvent.offsetY);
-  }, [drawIndicator]);
+    const x = e.nativeEvent.offsetX;
+    const y = e.nativeEvent.offsetY;
+    mousePosRef.current = { x, y };
+    if (isInsideImage(x, y)) {
+      drawIndicator(x, y);
+      if (maskCanvasRef.current) maskCanvasRef.current.style.cursor = 'none';
+    } else {
+      if (maskCanvasRef.current) maskCanvasRef.current.style.cursor = 'default';
+    }
+  }, [isInsideImage, drawIndicator]);
 
   const handleMaskMouseLeave = useCallback(() => {
     const ctx = indicatorCtxRef.current;
