@@ -1,0 +1,17 @@
+{
+  "name": "yingmei",
+  "version": "1.0.0",
+  "private": true,
+  "description": "映美 - AI修图平台",
+  "scripts": {
+    "dev": "pnpm --parallel -r dev",
+    "dev:client": "pnpm --filter @yingmei/client dev",
+    "dev:server": "pnpm --filter @yingmei/server dev",
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "format": "prettier --write \"packages/**/*.{ts,tsx,json}\""
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

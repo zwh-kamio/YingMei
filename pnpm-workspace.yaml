@@ -1,0 +1,11 @@
+packages:
+  - 'packages/*'
+
+allowBuilds:
+  '@nestjs/core': true
+  better-sqlite3: true
+  canvas: false
+  esbuild: true
+  sharp: true
+
+onlyBuiltDependencies: '[canvas]'

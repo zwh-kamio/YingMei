@@ -1,0 +1,54 @@
+.editor-toolbar {
+  width: 72px;
+  background: #16162a;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 8px 4px;
+  flex-shrink: 0;
+}
+
+.toolbar-tools {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.toolbar-group-label {
+  color: rgba(255, 255, 255, 0.35);
+  font-size: 10px;
+  padding: 4px 8px 2px;
+  text-align: center;
+  user-select: none;
+}
+
+.toolbar-btn {
+  color: rgba(255, 255, 255, 0.65) !important;
+  border: none !important;
+  height: 40px !important;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  border-radius: 8px !important;
+}
+
+.toolbar-btn:hover {
+  color: #fff !important;
+  background: rgba(255, 255, 255, 0.1) !important;
+}
+
+.toolbar-btn.active,
+.toolbar-btn.ant-btn-primary {
+  color: #fff !important;
+  background: #FF6B81 !important;
+}
+
+.toolbar-btn:disabled {
+  color: rgba(255, 255, 255, 0.2) !important;
+}
+
+.toolbar-bottom {
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  padding-top: 8px;
+  margin-top: 4px;
+}
