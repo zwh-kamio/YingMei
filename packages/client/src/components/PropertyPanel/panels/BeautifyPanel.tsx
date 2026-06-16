@@ -1,89 +1,103 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { Slider, Button, message, Divider, Spin, Progress } from 'antd';
-import { ThunderboltOutlined } from '@ant-design/icons';
+import { ThunderboltOutlined, LoadingOutlined } from '@ant-design/icons';
 import * as fabric from 'fabric';
 import { useEditorStore } from '../../../stores/editorStore';
-import { setPanelFilters, resetPanelFilters } from '../../../editor/filters/ImageFilters';
 import { ReplaceImageCommand } from '../../../editor/history/commands/ReplaceImageCommand';
-
-interface BeautyParams {
-  smooth: number;    // 磨皮 0-100
-  whiten: number;    // 美白 0-100
-  bigEye: number;    // 大眼 0-100
-  thinFace: number;  // 瘦脸 0-100
-}
+import { applyBeautifyFilters, clearBeautifyFilters } from '../../../editor/filters/beautify/BeautifyFilters';
+import { detectFace } from '../../../editor/beautify/FaceDetector';
+import type { BeautyParams, FaceData } from '../../../editor/beautify/types';
+import { DEFAULT_BEAUTY_PARAMS } from '../../../editor/beautify/types';
 
 export default function BeautifyPanel() {
   const canvasRef = useEditorStore((s) => s.canvasRef);
   const originalImageUrl = useEditorStore((s) => s.originalImageUrl);
   const historyManager = useEditorStore((s) => s.historyManager);
-  const [params, setParams] = useState<BeautyParams>({
-    smooth: 0,
-    whiten: 0,
-    bigEye: 0,
-    thinFace: 0,
-  });
+
+  const [params, setParams] = useState<BeautyParams>({ ...DEFAULT_BEAUTY_PARAMS });
+
+  // 人脸检测状态
+  const [faceStatus, setFaceStatus] = useState<'idle' | 'loading' | 'ready' | 'failed'>('idle');
+  const faceDataRef = useRef<FaceData | null>(null);
+  const detectStartedRef = useRef(false);
 
   // AI 美颜状态
   const [aiLoading, setAiLoading] = useState(false);
   const [aiProgress, setAiProgress] = useState(0);
 
-  // ============ 局部滤镜预览（即时响应，低质量） ============
+  // ============ 人脸检测初始化 ============
 
-  const applyBeauty = (newParams: BeautyParams) => {
-    const canvas = canvasRef as fabric.Canvas;
-    if (!canvas) return;
+  const initFaceDetection = useCallback(async () => {
+    if (detectStartedRef.current || faceStatus === 'loading') return;
+    detectStartedRef.current = true;
+    setFaceStatus('loading');
 
-    const bgImage = canvas.getObjects().find((o: any) => o.name === 'background') as fabric.FabricImage | undefined;
-    if (!bgImage) return;
+    try {
+      const canvas = canvasRef as fabric.Canvas;
+      if (!canvas) return;
 
-    const filters: fabric.filters.BaseFilter<any>[] = [];
+      const bgImage = canvas.getObjects().find(
+        (o: any) => o.name === 'background',
+      ) as fabric.FabricImage | undefined;
+      if (!bgImage) return;
 
-    // 磨皮：使用双边滤波模拟（高斯模糊 + 保留边缘）
-    if (newParams.smooth > 0) {
-      filters.push(
-        new fabric.filters.Blur({ blur: (newParams.smooth / 100) * 1.5 }),
-      );
-      const s = newParams.smooth / 100;
-      const center = 1 + s;
-      const edge = -s * 0.25;
-      filters.push(
-        new fabric.filters.Convolute({
-          matrix: [0, edge, 0, edge, center, edge, 0, edge, 0],
-        }),
-      );
+      // 获取底层 HTMLImageElement
+      const imgEl = (bgImage as any)._element as HTMLImageElement | undefined
+        ?? (bgImage as any).getElement?.() as HTMLImageElement | undefined;
+      if (!imgEl || !(imgEl instanceof HTMLImageElement)) {
+        // 尝试从 src 加载
+        const src = (bgImage as any).getSrc?.() ?? (bgImage as any).src;
+        if (typeof src !== 'string' || !src) {
+          setFaceStatus('failed');
+          return;
+        }
+        const loadedImg = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const img = new Image();
+          img.crossOrigin = 'anonymous';
+          img.onload = () => resolve(img);
+          img.onerror = reject;
+          img.src = src;
+        });
+        const faceData = await detectFace(loadedImg);
+        faceDataRef.current = faceData;
+        setFaceStatus(faceData ? 'ready' : 'failed');
+        return;
+      }
+
+      const faceData = await detectFace(imgEl);
+      faceDataRef.current = faceData;
+      setFaceStatus(faceData ? 'ready' : 'failed');
+    } catch (err) {
+      console.warn('Face detection failed:', err);
+      setFaceStatus('failed');
     }
+  }, [canvasRef, faceStatus]);
 
-    // 美白：提高亮度 + 降低饱和度
-    if (newParams.whiten > 0) {
-      filters.push(
-        new fabric.filters.Brightness({ brightness: (newParams.whiten / 100) * 0.3 }),
-      );
-      filters.push(
-        new fabric.filters.Saturation({ saturation: (newParams.whiten / 100) * -0.2 }),
-      );
-    }
+  // 面板首次加载时启动人脸检测
+  useEffect(() => {
+    initFaceDetection();
+    return () => {
+      // 面板卸载时不重置，保持检测结果缓存
+    };
+  }, []);
 
-    // 大眼：通过局部缩放实现（简化版）
-    if (newParams.bigEye > 0) {
-      const e = newParams.bigEye / 100;
-      filters.push(
-        new fabric.filters.Convolute({
-          matrix: [-e * 0.1, -e * 0.1, -e * 0.1, -e * 0.1, 1 + e * 0.8, -e * 0.1, -e * 0.1, -e * 0.1, -e * 0.1],
-        }),
-      );
-    }
+  // ============ 手动美颜（新管道） ============
 
-    // 瘦脸
-    if (newParams.thinFace > 0) {
-      filters.push(
-        new fabric.filters.Contrast({ contrast: (newParams.thinFace / 100) * 0.15 }),
-      );
-    }
+  const applyBeauty = useCallback(
+    (newParams: BeautyParams) => {
+      const canvas = canvasRef as fabric.Canvas;
+      if (!canvas) return;
 
-    setPanelFilters(bgImage, 'beautify', filters);
-    canvas.renderAll();
-  };
+      const bgImage = canvas.getObjects().find(
+        (o: any) => o.name === 'background',
+      ) as fabric.FabricImage | undefined;
+      if (!bgImage) return;
+
+      applyBeautifyFilters(bgImage, newParams, faceDataRef.current);
+      canvas.renderAll();
+    },
+    [canvasRef],
+  );
 
   const updateParam = (key: keyof BeautyParams, value: number) => {
     const newParams = { ...params, [key]: value };
@@ -94,12 +108,14 @@ export default function BeautifyPanel() {
   const resetAll = () => {
     const canvas = canvasRef as fabric.Canvas;
     if (!canvas) return;
-    const bgImage = canvas.getObjects().find((o: any) => o.name === 'background') as fabric.FabricImage | undefined;
+    const bgImage = canvas.getObjects().find(
+      (o: any) => o.name === 'background',
+    ) as fabric.FabricImage | undefined;
     if (!bgImage) return;
 
-    resetPanelFilters(bgImage, 'beautify');
+    clearBeautifyFilters(bgImage);
     canvas.renderAll();
-    setParams({ smooth: 0, whiten: 0, bigEye: 0, thinFace: 0 });
+    setParams({ ...DEFAULT_BEAUTY_PARAMS });
   };
 
   // ============ AI 智能美颜（服务端 DashScope Qwen-Image-Edit-Plus） ============
@@ -146,7 +162,6 @@ export default function BeautifyPanel() {
           setAiLoading(false);
           message.success('AI 美颜完成');
 
-          // 替换画布背景图（重新计算居中，通过命令模式支持撤销）
           const canvas = canvasRef as fabric.Canvas;
           if (canvas && task.resultImageUrl) {
             const bgImage = canvas.getObjects().find(
@@ -208,12 +223,24 @@ export default function BeautifyPanel() {
             <Progress percent={aiProgress} size="small" />
           </div>
         )}
-
       </Spin>
 
       <Divider style={{ borderColor: 'rgba(255,255,255,0.1)' }}>
         <span style={{ color: '#888', fontSize: 12 }}>手动微调</span>
       </Divider>
+
+      {/* ======== 人脸检测状态 ======== */}
+      {faceStatus === 'loading' && (
+        <div style={{ fontSize: 12, color: '#85d996', marginBottom: 12, textAlign: 'center' }}>
+          <LoadingOutlined style={{ marginRight: 6 }} />
+          正在检测人脸...
+        </div>
+      )}
+      {faceStatus === 'failed' && (
+        <div style={{ fontSize: 12, color: '#faad14', marginBottom: 12, textAlign: 'center' }}>
+          未检测到正脸，使用全局效果
+        </div>
+      )}
 
       {/* ======== 方式二：手动滑块微调（即时预览） ======== */}
       <div className="param-group">
