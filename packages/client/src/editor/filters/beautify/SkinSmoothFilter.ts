@@ -6,49 +6,70 @@ interface SkinSmoothOwnProps {
 }
 
 /**
- * 磨皮滤镜
- * - WebGL 路径：全局双边滤波近似（无遮罩，兼容 Fabric.js 渲染管线）
- * - Canvas2D 路径：肤色遮罩区域内双边滤波近似
+ * 磨皮滤镜：肤色遮罩区域内双边滤波近似
+ * - WebGL 路径：双纹理着色器，mask 限定区域
+ * - Canvas2D 路径：像素级双边滤波 + mask
  */
 export class SkinSmoothFilter extends fabric.filters.BaseFilter<'SkinSmooth', SkinSmoothOwnProps> {
   static type = 'SkinSmooth';
-  static uniformLocations = ['uStrength'];
+  static uniformLocations = ['uStrength', 'uSkinMask'];
 
   declare strength: number;
   declare skinMask: HTMLCanvasElement;
 
   static defaults = { strength: 0, skinMask: null };
 
+  getVertexSource(): string {
+    return /* glsl */ `
+      attribute vec2 aPosition;
+      varying vec2 vTexCoord;
+      varying vec2 vTexCoord2;
+      void main() {
+        vTexCoord = aPosition;
+        vTexCoord2 = aPosition;
+        gl_Position = vec4(aPosition * 2.0 - 1.0, 0.0, 1.0);
+      }
+    `;
+  }
+
   getFragmentSource(): string {
     return /* glsl */ `
       precision highp float;
       uniform sampler2D uTexture;
+      uniform sampler2D uSkinMask;
       uniform float uStrength;
       varying vec2 vTexCoord;
+      varying vec2 vTexCoord2;
 
       void main() {
         vec4 color = texture2D(uTexture, vTexCoord);
-        if (uStrength < 0.01) {
+        float mask = texture2D(uSkinMask, vTexCoord2).a;
+
+        if (mask < 0.01 || uStrength < 0.01) {
           gl_FragColor = color;
           return;
         }
-        vec2 step = vec2(0.004);
+
+        vec2 step = vec2(0.003);
         float totalWeight = 0.0;
         vec3 blurred = vec3(0.0);
-        for (int x = -2; x <= 2; x++) {
-          for (int y = -2; y <= 2; y++) {
+
+        for (int x = -1; x <= 1; x++) {
+          for (int y = -1; y <= 1; y++) {
             vec2 offset = vec2(float(x), float(y)) * step;
             vec3 sampleColor = texture2D(uTexture, vTexCoord + offset).rgb;
-            float spatialWeight = 1.0 - (abs(float(x)) + abs(float(y))) / 6.0;
+            float spatialWeight = 1.0 - (abs(float(x)) + abs(float(y))) * 0.35;
             float colorDiff = distance(color.rgb, sampleColor);
-            float rangeWeight = 1.0 - smoothstep(0.0, 0.3, colorDiff);
+            float rangeWeight = 1.0 - smoothstep(0.0, 0.25, colorDiff);
             float weight = spatialWeight * rangeWeight;
             blurred += sampleColor * weight;
             totalWeight += weight;
           }
         }
+
         blurred /= max(totalWeight, 1.0);
-        gl_FragColor = vec4(mix(color.rgb, blurred, uStrength), color.a);
+        float effectiveStrength = uStrength * mask;
+        gl_FragColor = vec4(mix(color.rgb, blurred, effectiveStrength), color.a);
       }
     `;
   }
@@ -66,6 +87,35 @@ export class SkinSmoothFilter extends fabric.filters.BaseFilter<'SkinSmooth', Sk
     uniformLocations: Record<string, WebGLUniformLocation>,
   ): void {
     gl.uniform1f(uniformLocations.uStrength, this.strength);
+    if (uniformLocations.uSkinMask) {
+      gl.uniform1i(uniformLocations.uSkinMask, 1);
+    }
+  }
+
+  applyToWebGL(options: any): void {
+    const gl = options.context as WebGLRenderingContext;
+    if (!gl || !this.skinMask) {
+      super.applyToWebGL(options);
+      return;
+    }
+
+    // 实例级纹理缓存，避免每帧重建
+    if (!(this as any)._maskTexture) {
+      const tex = gl.createTexture();
+      if (!tex) { super.applyToWebGL(options); return; }
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.skinMask);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      (this as any)._maskTexture = tex;
+    }
+
+    this.bindAdditionalTexture(gl, (this as any)._maskTexture as WebGLTexture, gl.TEXTURE1);
+    super.applyToWebGL(options);
+    this.unbindAdditionalTexture(gl, gl.TEXTURE1);
   }
 
   applyTo2d(options: any): void {
@@ -77,7 +127,6 @@ export class SkinSmoothFilter extends fabric.filters.BaseFilter<'SkinSmooth', Sk
     const height = imageData.height as number;
     const temp = new Uint8ClampedArray(data);
 
-    // 有遮罩时仅处理肤色区域
     let maskData: Uint8ClampedArray | null = null;
     let maskW = 0, maskH = 0;
     if (this.skinMask) {
@@ -94,12 +143,10 @@ export class SkinSmoothFilter extends fabric.filters.BaseFilter<'SkinSmooth', Sk
 
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
-        // 遮罩检查
         if (maskData) {
           const mx = Math.floor((x / width) * maskW);
           const my = Math.floor((y / height) * maskH);
-          const maskAlpha = maskData[(my * maskW + mx) * 4 + 3] / 255;
-          if (maskAlpha < 0.05) continue;
+          if ((maskData[(my * maskW + mx) * 4 + 3] / 255) < 0.05) continue;
         }
 
         const idx = (y * width + x) * 4;
