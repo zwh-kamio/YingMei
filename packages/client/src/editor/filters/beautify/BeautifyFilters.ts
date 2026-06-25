@@ -1,6 +1,6 @@
 import * as fabric from 'fabric';
 import type { BeautyParams, FaceData, NormalizedLandmark } from '../../beautify/types';
-import { FACE_OVAL, LEFT_EYE_CONTOUR, RIGHT_EYE_CONTOUR } from '../../beautify/landmarks';
+import { FACE_OVAL, JAWLINE, LEFT_EYE_CONTOUR, RIGHT_EYE_CONTOUR } from '../../beautify/landmarks';
 import { setPanelFilters, resetPanelFilters } from '../ImageFilters';
 import { SkinSmoothFilter } from './SkinSmoothFilter';
 import { SkinWhitenFilter } from './SkinWhitenFilter';
@@ -73,33 +73,60 @@ export function applyBeautifyFilters(
     }
   }
 
-  // 瘦脸：用面部轮廓计算椭圆参数（中心 + 半轴长）
+  // 瘦脸：gpupixel Local Translation Warp 算法
+  // 使用 JAWLINE（下颌轮廓 18 点）作为控制点，每个控制点向面部中心收缩
   if (params.thinFace > 0 && face) {
-    // 使用鼻梁根部（landmark 168）作为面部中心，比下颌中心更准确
     const nose = face[168];
     const faceCtr = nose
       ? { x: nose.x, y: nose.y }
       : faceCenter(face, FACE_OVAL);
 
     if (faceCtr) {
-      // 从面部轮廓计算椭圆半径（覆盖整个面部的椭圆）
-      let maxDx = 0.04, maxDy = 0.04;
-      for (const i of FACE_OVAL) {
-        if (!face[i]) continue;
-        const dx = Math.abs(face[i].x - faceCtr.x);
-        const dy = Math.abs(face[i].y - faceCtr.y);
-        if (dx > maxDx) maxDx = dx;
-        if (dy > maxDy) maxDy = dy;
+      const controlPoints: number[] = [];
+      const deltas: number[] = [];
+      const radii: number[] = [];
+      let validCount = 0;
+
+      for (const i of JAWLINE) {
+        const pt = face[i];
+        if (!pt) continue;
+
+        // 控制点 UV 坐标
+        controlPoints.push(pt.x, pt.y);
+
+        // 收缩方向：从面部中心指向控制点，反方向即为收缩方向
+        const dirX = pt.x - faceCtr.x;
+        const dirY = pt.y - faceCtr.y;
+        const distFromCenter = Math.sqrt(dirX * dirX + dirY * dirY);
+        if (distFromCenter < 0.001) {
+          deltas.push(0, 0);
+        } else {
+          // 控制点向内收缩：delta = -direction * shrinkFactor
+          // shrinkFactor 基于控制点到面部中心的距离，越远收缩越多
+          const shrinkFactor = distFromCenter * 0.12;
+          deltas.push(-dirX / distFromCenter * shrinkFactor, -dirY / distFromCenter * shrinkFactor);
+        }
+
+        // 影响半径：与控制点到中心的距离成正比，同时考虑相邻控制点间距
+        // 基础半径 ~0.04 UV，乘以 1.0~1.5 根据位置调整
+        const baseRadius = 0.045;
+        radii.push(baseRadius);
+
+        validCount++;
       }
 
-      filters.push(
-        new FaceSlimFilter({
-          strength: params.thinFace / 100,
-          faceCenter: [faceCtr.x, faceCtr.y],
-          radiusX: maxDx * 1.15,   // 稍大于轮廓宽
-          radiusY: maxDy * 1.1,    // 稍大于轮廓高
-        }),
-      );
+      if (validCount > 0) {
+        filters.push(
+          new FaceSlimFilter({
+            strength: params.thinFace / 100,
+            faceCenter: [faceCtr.x, faceCtr.y],
+            controlPoints,
+            deltas,
+            radii,
+            pointCount: validCount,
+          }),
+        );
+      }
     }
   }
 
