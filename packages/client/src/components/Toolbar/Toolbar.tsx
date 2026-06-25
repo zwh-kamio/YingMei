@@ -1,5 +1,5 @@
 import React, { useRef, useCallback } from 'react';
-import { Button, Tooltip, Space, Divider } from 'antd';
+import { Button, Tooltip, Space, Divider, message } from 'antd';
 import {
   SelectOutlined,
   ExpandOutlined,
@@ -17,6 +17,7 @@ import {
   EyeOutlined,
   UndoOutlined,
   RedoOutlined,
+  DownloadOutlined,
 } from '@ant-design/icons';
 import { useEditorStore } from '../../stores/editorStore';
 import type { EditorTool } from '../../types';
@@ -78,6 +79,119 @@ const toolGroups: { name: string; tools: ToolItem[] }[] = [
 
 const allTools = toolGroups.flatMap((g) => g.tools);
 
+// ============ 跨域图片代理导出 ============
+
+/** 将远程 URL 通过后端代理转为可在当前域使用的 data URL */
+async function fetchViaProxy(url: string): Promise<string> {
+  const resp = await fetch(`/api/upload/proxy-image?url=${encodeURIComponent(url)}`);
+  if (!resp.ok) throw new Error(`proxy fetch failed: ${resp.status}`);
+  const blob = await resp.blob();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+/** 获取 FabricImage 的当前 src */
+function getImageSrc(img: fabric.FabricImage): string {
+  return (img as any).getSrc?.()
+    || (img as any)._originalElement?.currentSrc
+    || (img as any)._element?.src
+    || '';
+}
+
+/**
+ * 代理导出：将所有远程图片转为 data URL 后，在离屏 canvas 上逐层绘制，
+ * 完全绕过 fabric 的 WebGL 纹理缓存和 toCanvasElement 的跨域限制。
+ */
+async function exportViaProxy(
+  sourceCanvas: fabric.Canvas,
+  cropLeft: number,
+  cropTop: number,
+  cropW: number,
+  cropH: number,
+): Promise<string> {
+  // 收集需要代理的图片对象
+  interface Layer {
+    obj: fabric.FabricImage;
+    dataUrl: string;
+  }
+  const layers: Layer[] = [];
+
+  for (const obj of sourceCanvas.getObjects()) {
+    if (!(obj instanceof fabric.FabricImage)) continue;
+    const src = getImageSrc(obj);
+    if (!src || src.startsWith('data:')) continue;
+
+    const dataUrl = await fetchViaProxy(src);
+    layers.push({ obj, dataUrl });
+  }
+
+  // 创建离屏 canvas，尺寸 = 图片区域
+  const out = document.createElement('canvas');
+  out.width = cropW;
+  out.height = cropH;
+  const ctx = out.getContext('2d')!;
+
+  // 按 z-order 逐层绘制（getObjects 从底到顶）
+  for (const fabricObj of sourceCanvas.getObjects()) {
+    const left = (fabricObj.left ?? 0) - cropLeft;
+    const top = (fabricObj.top ?? 0) - cropTop;
+
+    if (fabricObj instanceof fabric.FabricImage) {
+      // 查找是否已通过代理获取 data URL
+      const layer = layers.find((l) => l.obj === fabricObj);
+      const src = layer?.dataUrl || getImageSrc(fabricObj);
+
+      if (!src) continue;
+
+      const img = await loadImage(src);
+      const sw = (fabricObj.width ?? img.width) * (fabricObj.scaleX ?? 1);
+      const sh = (fabricObj.height ?? img.height) * (fabricObj.scaleY ?? 1);
+
+      ctx.save();
+      // 变换：以图片中心为原点
+      const cx = left + sw / 2;
+      const cy = top + sh / 2;
+      ctx.translate(cx, cy);
+      if (fabricObj.flipX) ctx.scale(-1, 1);
+      if (fabricObj.flipY) ctx.scale(1, -1);
+      if (fabricObj.angle) ctx.rotate((fabricObj.angle * Math.PI) / 180);
+      ctx.globalAlpha = fabricObj.opacity ?? 1;
+      ctx.drawImage(img, -sw / 2, -sh / 2, sw, sh);
+      ctx.restore();
+    } else if (fabricObj instanceof fabric.IText || fabricObj instanceof fabric.Text) {
+      const text = fabricObj as fabric.IText;
+      ctx.save();
+      ctx.font = `${text.fontStyle || ''} ${text.fontWeight || ''} ${text.fontSize || 40}px ${text.fontFamily || 'sans-serif'}`;
+      ctx.fillStyle = text.fill as string || '#ffffff';
+      ctx.globalAlpha = text.opacity ?? 1;
+      if (text.stroke && text.strokeWidth) {
+        ctx.strokeStyle = text.stroke as string;
+        ctx.lineWidth = text.strokeWidth;
+        ctx.strokeText(text.text || '', left, top + (text.fontSize || 40));
+      }
+      ctx.fillText(text.text || '', left, top + (text.fontSize || 40));
+      ctx.restore();
+    }
+  }
+
+  return out.toDataURL('image/png');
+}
+
+/** 将 URL（data URL 或普通 URL）加载为 HTMLImageElement */
+function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    if (!src.startsWith('data:')) img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+
 export default function Toolbar() {
   const activeTool = useEditorStore((s) => s.activeTool);
   const setActiveTool = useEditorStore((s) => s.setActiveTool);
@@ -119,6 +233,86 @@ export default function Toolbar() {
     (canvas as any).sendObjectToBack(savedImageRef.current);
     canvas.renderAll();
     savedImageRef.current = null;
+  }, [canvasRef]);
+
+  // ============ 下载画布为 PNG（仅导出图片区域，不含画布背景） ============
+  const handleDownload = useCallback(async () => {
+    const canvas = canvasRef as fabric.Canvas;
+    if (!canvas) {
+      message.warning('画布未就绪');
+      return;
+    }
+
+    const bg = canvas.getObjects().find(
+      (o: any) => o.name === 'background',
+    ) as fabric.FabricImage | undefined;
+    if (!bg) {
+      message.warning('没有可下载的图片');
+      return;
+    }
+
+    const activeObj = canvas.getActiveObject();
+    canvas.discardActiveObject();
+
+    const bgRect = bg.getBoundingRect();
+    const cropLeft = bgRect.left;
+    const cropTop = bgRect.top;
+    const cropW = bgRect.width;
+    const cropH = bgRect.height;
+
+    const origBg = canvas.backgroundColor;
+    canvas.backgroundColor = 'transparent';
+    canvas.renderAll();
+
+    let fullCanvas: HTMLCanvasElement;
+    let dataUrl: string | undefined;
+    try {
+      // 路径 1：直接导出
+      fullCanvas = canvas.toCanvasElement({ multiplier: 1, format: 'png', quality: 1 });
+
+      // 跨域污染可能导致输出 canvas 尺寸为 0
+      if (fullCanvas.width === 0 || fullCanvas.height === 0) {
+        throw new DOMException('Canvas tainted', 'SecurityError');
+      }
+
+      canvas.backgroundColor = origBg;
+      if (activeObj) canvas.setActiveObject(activeObj);
+      canvas.renderAll();
+    } catch (e) {
+      canvas.backgroundColor = origBg;
+      if (activeObj) canvas.setActiveObject(activeObj);
+      canvas.renderAll();
+
+      if (e instanceof DOMException && (e.name === 'SecurityError' || e.name === 'InvalidStateError')) {
+        try {
+          // 路径 2：通过代理获取所有远程图片，在离屏 canvas 上重建导出
+          dataUrl = await exportViaProxy(canvas, cropLeft, cropTop, cropW, cropH);
+        } catch (proxyErr) {
+          console.error('Proxy export failed:', proxyErr);
+          message.error('导出失败，请稍后重试');
+          return;
+        }
+      } else {
+        throw e;
+      }
+    }
+
+    // 路径 1 成功：裁剪导出
+    if (!dataUrl) {
+      const crop = document.createElement('canvas');
+      crop.width = cropW;
+      crop.height = cropH;
+      crop.getContext('2d')!.drawImage(fullCanvas, cropLeft, cropTop, cropW, cropH, 0, 0, cropW, cropH);
+      dataUrl = crop.toDataURL('image/png');
+    }
+
+    const link = document.createElement('a');
+    link.download = `yingmei-${Date.now()}.png`;
+    link.href = dataUrl;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    message.success('下载成功');
   }, [canvasRef]);
 
   return (
@@ -180,6 +374,15 @@ export default function Toolbar() {
             onMouseLeave={restoreEdited}
             onTouchStart={showOriginal}
             onTouchEnd={restoreEdited}
+          />
+        </Tooltip>
+        <Tooltip title="下载图片">
+          <Button
+            type="text"
+            icon={<DownloadOutlined />}
+            onClick={handleDownload}
+            className="toolbar-btn"
+            block
           />
         </Tooltip>
       </div>

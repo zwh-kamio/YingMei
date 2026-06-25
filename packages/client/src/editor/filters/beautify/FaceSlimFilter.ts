@@ -1,98 +1,129 @@
 import * as fabric from 'fabric';
 
 /**
- * 瘦脸滤镜：沿下颌轮廓向内推 UV 坐标（仅 Canvas2D 路径）
+ * 瘦脸滤镜：面部区域像素向内（面部中心）收缩
  *
- * GLSL uniform 数组在 Fabric.js 渲染管线中不稳定，故 WebGL 路径使用默认透传，
- * 实际形变逻辑在 applyTo2d 中实现。
+ * 策略：
+ * - 以面部中心为原点，椭圆区域内的像素沿径向向内偏移
+ * - 力场在椭圆边缘最强，向中心平滑衰减（二次衰减函数）
+ * - WebGL：单纹理着色器，uniform 传中心+椭圆轴长
+ * - Canvas2D：同样逻辑的像素级实现
  */
 
 interface FaceSlimOwnProps {
   strength: number;
-  contourPoints: [number, number][];
-  slimWidth: number;
-  faceCenter: [number, number];
+  faceCenter: [number, number];    // 归一化 UV
+  /** 瘦脸椭圆半轴长（归一化），面宽方向 */
+  radiusX: number;
+  /** 瘦脸椭圆半轴长（归一化），面高方向 */
+  radiusY: number;
 }
 
 export class FaceSlimFilter extends fabric.filters.BaseFilter<'FaceSlim', FaceSlimOwnProps> {
   static type = 'FaceSlim';
-  static uniformLocations: string[] = [];
+  static uniformLocations = ['uStrength', 'uFaceCenter', 'uRadiusX', 'uRadiusY'];
 
   declare strength: number;
-  declare contourPoints: [number, number][];
-  declare slimWidth: number;
   declare faceCenter: [number, number];
+  declare radiusX: number;
+  declare radiusY: number;
 
   static defaults = {
     strength: 0,
-    contourPoints: [] as [number, number][],
-    slimWidth: 0.08,
     faceCenter: [0.5, 0.5] as [number, number],
+    radiusX: 0.15,
+    radiusY: 0.22,
   };
 
+  getFragmentSource(): string {
+    return /* glsl */ `
+      precision highp float;
+      uniform sampler2D uTexture;
+      uniform float uStrength;
+      uniform vec2 uFaceCenter;
+      uniform float uRadiusX;
+      uniform float uRadiusY;
+      varying vec2 vTexCoord;
+
+      void main() {
+        vec2 coord = vTexCoord;
+
+        if (uStrength < 0.01) {
+          gl_FragColor = texture2D(uTexture, coord);
+          return;
+        }
+
+        // 归一化到椭圆坐标系的偏移
+        vec2 delta = coord - uFaceCenter;
+        float en = (delta.x * delta.x) / (uRadiusX * uRadiusX)
+                 + (delta.y * delta.y) / (uRadiusY * uRadiusY);
+
+        if (en < 1.0) {
+          // 在椭圆内：沿径向向内推
+          // 衰减函数：边缘力最大(en→1.0)，中心力最小(en→0.0)
+          float factor = en;
+          float warp = uStrength * 0.06 * factor;
+          float dist = length(delta);
+          if (dist > 0.0001) {
+            vec2 direction = delta / dist;     // 向外的径向
+            coord = coord + direction * warp;  // 向外采样 → 外侧像素向内收缩
+          }
+        }
+
+        coord = clamp(coord, 0.0, 1.0);
+        gl_FragColor = texture2D(uTexture, coord);
+      }
+    `;
+  }
+
+  getCacheKey(): string {
+    return `${this.type}_${this.strength.toFixed(2)}`;
+  }
+
   isNeutralState(): boolean {
-    return this.strength === 0 || this.contourPoints.length < 2;
+    return this.strength === 0;
+  }
+
+  sendUniformData(
+    gl: WebGLRenderingContext,
+    uniformLocations: Record<string, WebGLUniformLocation>,
+  ): void {
+    gl.uniform1f(uniformLocations.uStrength, this.strength);
+    gl.uniform2f(uniformLocations.uFaceCenter, this.faceCenter[0], this.faceCenter[1]);
+    gl.uniform1f(uniformLocations.uRadiusX, this.radiusX);
+    gl.uniform1f(uniformLocations.uRadiusY, this.radiusY);
   }
 
   applyTo2d(options: any): void {
     const { imageData } = options;
-    if (!imageData || this.strength <= 0 || this.contourPoints.length < 2) return;
+    if (!imageData || this.strength <= 0) return;
 
     const src = new Uint8ClampedArray(imageData.data);
     const data = imageData.data as Uint8ClampedArray;
     const width = imageData.width as number;
     const height = imageData.height as number;
 
-    // 归一化 → 像素坐标
-    const toPx = (uv: [number, number]): [number, number] => [
-      uv[0] * width,
-      uv[1] * height,
-    ];
-    const pxContour = this.contourPoints.map(toPx);
-    const [fcx, fcy] = toPx(this.faceCenter);
-    const slimPx = this.slimWidth * Math.max(width, height);
+    const cx = this.faceCenter[0] * width;
+    const cy = this.faceCenter[1] * height;
+    const rx = this.radiusX * width;
+    const ry = this.radiusY * height;
 
     const clamp = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), hi);
 
-    // 点到线段距离
-    const segDist = (
-      px: number, py: number,
-      ax: number, ay: number,
-      bx: number, by: number,
-    ): number => {
-      const abx = bx - ax, aby = by - ay;
-      const apx = px - ax, apy = py - ay;
-      const dot = apx * abx + apy * aby;
-      const lenSq = abx * abx + aby * aby;
-      if (lenSq < 0.0001) return Math.sqrt(apx * apx + apy * apy);
-      const t = clamp(dot / lenSq, 0, 1);
-      const cpx = ax + t * abx, cpy = ay + t * aby;
-      return Math.sqrt((px - cpx) ** 2 + (py - cpy) ** 2);
-    };
-
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
-        let minDist = Infinity;
-        for (let i = 0; i < pxContour.length - 1; i++) {
-          const d = segDist(
-            x, y,
-            pxContour[i][0], pxContour[i][1],
-            pxContour[i + 1][0], pxContour[i + 1][1],
-          );
-          if (d < minDist) minDist = d;
-        }
+        const dx = x - cx;
+        const dy = y - cy;
+        const en = (dx * dx) / (rx * rx) + (dy * dy) / (ry * ry);
 
-        if (minDist >= slimPx) continue;
+        if (en >= 1.0) continue;
 
-        const factor = 1 - minDist / slimPx;
-        const warp = this.strength * 0.08 * factor * factor;
-
-        const dx = fcx - x;
-        const dy = fcy - y;
+        const factor = en;
+        const warp = this.strength * 0.06 * factor;
         const dist = Math.sqrt(dx * dx + dy * dy);
         if (dist < 0.5) continue;
-        const nx = dx / dist, ny = dy / dist;
 
+        const nx = dx / dist, ny = dy / dist;
         let sx = x + nx * warp * Math.max(width, height);
         let sy = y + ny * warp * Math.max(width, height);
         sx = clamp(Math.round(sx), 0, width - 1);

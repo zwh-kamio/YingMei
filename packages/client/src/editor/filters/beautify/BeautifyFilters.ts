@@ -1,6 +1,6 @@
 import * as fabric from 'fabric';
 import type { BeautyParams, FaceData, NormalizedLandmark } from '../../beautify/types';
-import { JAWLINE, LEFT_EYE_CONTOUR, RIGHT_EYE_CONTOUR } from '../../beautify/landmarks';
+import { FACE_OVAL, LEFT_EYE_CONTOUR, RIGHT_EYE_CONTOUR } from '../../beautify/landmarks';
 import { setPanelFilters, resetPanelFilters } from '../ImageFilters';
 import { SkinSmoothFilter } from './SkinSmoothFilter';
 import { SkinWhitenFilter } from './SkinWhitenFilter';
@@ -73,18 +73,31 @@ export function applyBeautifyFilters(
     }
   }
 
-  // 瘦脸
+  // 瘦脸：用面部轮廓计算椭圆参数（中心 + 半轴长）
   if (params.thinFace > 0 && face) {
-    const contour = sampleContour(face, JAWLINE, 16);
-    const faceCtr = faceCenter(face, JAWLINE);
+    // 使用鼻梁根部（landmark 168）作为面部中心，比下颌中心更准确
+    const nose = face[168];
+    const faceCtr = nose
+      ? { x: nose.x, y: nose.y }
+      : faceCenter(face, FACE_OVAL);
 
-    if (contour.length >= 2 && faceCtr) {
+    if (faceCtr) {
+      // 从面部轮廓计算椭圆半径（覆盖整个面部的椭圆）
+      let maxDx = 0.04, maxDy = 0.04;
+      for (const i of FACE_OVAL) {
+        if (!face[i]) continue;
+        const dx = Math.abs(face[i].x - faceCtr.x);
+        const dy = Math.abs(face[i].y - faceCtr.y);
+        if (dx > maxDx) maxDx = dx;
+        if (dy > maxDy) maxDy = dy;
+      }
+
       filters.push(
         new FaceSlimFilter({
           strength: params.thinFace / 100,
-          contourPoints: contour,
-          slimWidth: 0.08,
           faceCenter: [faceCtr.x, faceCtr.y],
+          radiusX: maxDx * 1.15,   // 稍大于轮廓宽
+          radiusY: maxDy * 1.1,    // 稍大于轮廓高
         }),
       );
     }
@@ -132,27 +145,6 @@ function computeEyeRadius(
   }
 
   return maxDist * 1.6; // 扩大覆盖范围确保边缘平滑
-}
-
-/** 从轮廓关键点均匀采样 N 个点 */
-function sampleContour(
-  face: NormalizedLandmark[],
-  indices: number[],
-  n: number,
-): [number, number][] {
-  const pts: [number, number][] = [];
-  const step = Math.max(1, Math.floor(indices.length / (n - 1)));
-  for (let i = 0; i < indices.length; i += step) {
-    const lm = face[indices[i]];
-    if (lm) pts.push([lm.x, lm.y]);
-    if (pts.length >= n) break;
-  }
-  // 确保包含最后一个点
-  if (pts.length < n) {
-    const last = face[indices[indices.length - 1]];
-    if (last) pts.push([last.x, last.y]);
-  }
-  return pts;
 }
 
 /** 面部中心（下颌线关键点的几何中心） */
